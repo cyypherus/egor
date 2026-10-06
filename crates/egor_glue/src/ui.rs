@@ -26,8 +26,15 @@ impl EguiRenderer {
         let ctx = Context::default();
         let viewport_id = ctx.viewport_id();
         let state = State::new(ctx.clone(), viewport_id, window, None, None, None);
-        let renderer =
-            egui_wgpu::Renderer::new(device, surface_format, Default::default(), 1, false);
+        let renderer = egui_wgpu::Renderer::new(
+            device,
+            surface_format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                dithering: false,
+                ..Default::default()
+            },
+        );
 
         Self {
             ctx,
@@ -79,7 +86,7 @@ impl EguiRenderer {
                 .update_texture(device, queue, *id, image_delta);
         }
 
-        self.renderer.update_buffers(
+        let callback_commands = self.renderer.update_buffers(
             device,
             queue,
             encoder,
@@ -87,11 +94,16 @@ impl EguiRenderer {
             &screen_descriptor,
         );
 
+        if !callback_commands.is_empty() {
+            queue.submit(callback_commands);
+        }
+
         let render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("egui"),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view,
                 resolve_target: None,
+                depth_slice: None,
                 ops: Operations {
                     load: LoadOp::Load,
                     store: StoreOp::Store,
@@ -100,6 +112,7 @@ impl EguiRenderer {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         self.renderer.render(
