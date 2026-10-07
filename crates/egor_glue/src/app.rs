@@ -14,7 +14,28 @@ use egor_render::{
     target::{Backbuffer, RenderTarget},
 };
 
-type UpdateFn = dyn FnMut(&mut FrameContext);
+type UpdateFn<U> = dyn FnMut(&mut FrameContext<U>);
+
+pub trait Ui {
+    fn handle_event(&mut self, window: &Window, event: &WindowEvent);
+    fn render(
+        &mut self,
+        renderer: &Renderer,
+        window: &Window,
+        frame: &mut egor_render::frame::Frame,
+    );
+}
+
+impl Ui for () {
+    fn handle_event(&mut self, _: &Window, _: &WindowEvent) {}
+    fn render(&mut self, _: &Renderer, _: &Window, _: &mut egor_render::frame::Frame) {}
+}
+
+enum WindowUi<U> {
+    #[expect(clippy::type_complexity)]
+    Create(Box<dyn FnMut(&Renderer, &Window, egor_render::TextureFormat) -> U>),
+    Ready(U),
+}
 
 pub struct AppControl<'a> {
     window: &'a Window,
@@ -49,7 +70,8 @@ impl<'a> AppControl<'a> {
     }
 }
 
-pub struct FrameContext<'a> {
+pub struct FrameContext<'a, U = ()> {
+    pub ui: &'a mut U,
     pub events: Vec<WindowEvent>,
     pub app: AppControl<'a>,
     pub gfx: Graphics<'a>,
@@ -59,9 +81,10 @@ pub struct FrameContext<'a> {
     pub egui_ctx: &'a egui::Context,
 }
 
-pub struct App {
+pub struct App<U = ()> {
+    ui: WindowUi<U>,
     events: Vec<WindowEvent>,
-    update: Option<Box<UpdateFn>>,
+    update: Option<Box<UpdateFn<U>>>,
     config: Option<AppConfig>,
     vsync: bool,
     text_renderer: Option<TextRenderer>,
@@ -72,16 +95,17 @@ pub struct App {
     memory_hints: MemoryHints,
 }
 
-impl Default for App {
+impl Default for App<()> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl App {
+impl App<()> {
     /// Create a new [`App`]
     pub fn new() -> Self {
         Self {
+            ui: WindowUi::Ready(()),
             events: Vec::new(),
             update: None,
             config: Some(AppConfig::default()),
@@ -95,6 +119,27 @@ impl App {
         }
     }
 
+    pub fn with_ui<U: Ui + 'static>(
+        self,
+        create: impl FnMut(&Renderer, &Window, egor_render::TextureFormat) -> U + 'static,
+    ) -> App<U> {
+        App {
+            ui: WindowUi::Create(Box::new(create)),
+            events: self.events,
+            update: None,
+            config: self.config,
+            vsync: self.vsync,
+            text_renderer: self.text_renderer,
+            #[cfg(feature = "ui")]
+            egui: self.egui,
+            backbuffer: self.backbuffer,
+            primitive_batch: self.primitive_batch,
+            memory_hints: self.memory_hints,
+        }
+    }
+}
+
+impl<U: Ui + 'static> App<U> {
     /// Set application title
     pub fn title(mut self, title: &str) -> Self {
         if let Some(c) = self.config.as_mut() {
@@ -199,12 +244,15 @@ impl App {
     }
 
     /// Run the app with a per-frame update closure
-    pub fn run(mut self, #[allow(unused_mut)] mut update: impl FnMut(&mut FrameContext) + 'static) {
+    pub fn run(
+        mut self,
+        #[allow(unused_mut)] mut update: impl FnMut(&mut FrameContext<U>) + 'static,
+    ) {
         #[cfg(all(feature = "hot_reload", not(target_arch = "wasm32")))]
         let update = {
             dioxus_devtools::connect_subsecond();
 
-            move |ctx: &mut FrameContext| {
+            move |ctx: &mut FrameContext<U>| {
                 dioxus_devtools::subsecond::call(|| update(ctx));
             }
         };
@@ -215,13 +263,16 @@ impl App {
     }
 }
 
-impl AppHandler<Renderer> for App {
+impl<U: Ui + 'static> AppHandler<Renderer> for App<U> {
     fn on_window_event(&mut self, _window: &Window, event: &WindowEvent) {
         #[cfg(feature = "ui")]
         if let Some(egui) = self.egui.as_mut() {
             egui.handle_event(_window, event);
         }
 
+        if let WindowUi::Ready(ui) = &mut self.ui {
+            ui.handle_event(_window, event);
+        }
         self.events.push(event.clone());
     }
 
@@ -259,6 +310,10 @@ impl AppHandler<Renderer> for App {
             self.egui = Some(EguiRenderer::new(device, format, window));
         }
 
+        if let WindowUi::Create(create) = &mut self.ui {
+            self.ui = WindowUi::Ready(create(renderer, window, format));
+        }
+
         self.resize(
             window.inner_size().width,
             window.inner_size().height,
@@ -290,7 +345,11 @@ impl AppHandler<Renderer> for App {
 
         #[cfg(feature = "ui")]
         let egui_ctx = self.egui.as_mut().unwrap().begin_frame(_window);
+        let WindowUi::Ready(ui) = &mut self.ui else {
+            unreachable!("UI is initialized before frames");
+        };
         let mut ctx = FrameContext {
+            ui: &mut *ui,
             events: std::mem::take(&mut self.events),
             app: AppControl {
                 window: _window,
@@ -347,6 +406,8 @@ impl AppHandler<Renderer> for App {
                 render_data,
             );
         }
+
+        ui.render(renderer, _window, &mut frame);
 
         renderer.end_frame(frame);
 
